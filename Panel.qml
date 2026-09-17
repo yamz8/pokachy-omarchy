@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Effects
 import QtQuick.Controls
 import QtQuick.Controls as QQC
+import QtQuick.Dialogs as Dialogs
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -20,6 +21,11 @@ Panel {
       needsLogin: true
     })
   property bool stateLoaded: false
+  property bool settingsOpen: false
+  property real settingsPanelContentHeight: 0
+  property string settingsOriginalName: ""
+  property string settingsOriginalHandle: ""
+  property bool settingsActivationReady: false
   property string actionError: ""
   property string actionNotice: ""
   property string statusError: ""
@@ -54,6 +60,10 @@ Panel {
   readonly property bool actionRunning: actionProc.running
   readonly property bool needsLogin: pokachyState && pokachyState.needsLogin === true
   readonly property bool online: pokachyState && pokachyState.online === true
+  readonly property bool settingsNameValid: settingsName.text.trim().length > 0 && settingsName.text.trim().length <= 80
+  readonly property bool settingsHandleValid: /^[a-z0-9][a-z0-9_]{2,23}$/.test(settingsHandle.text.trim())
+  readonly property bool settingsDirty: settingsName.text.trim() !== settingsOriginalName || settingsHandle.text.trim() !== settingsOriginalHandle
+  readonly property bool settingsCanSave: settingsOpen && settingsDirty && settingsNameValid && settingsHandleValid && !actionRunning
   readonly property color secondaryForeground: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.65)
   readonly property int inboxCount: pokachyState && pokachyState.inbox ? pokachyState.inbox.length : 0
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -153,7 +163,7 @@ Panel {
     Image {
       id: photo
       anchors.fill: parent
-      source: /^https:\/\/avatars\.githubusercontent\.com\//.test(avatar.image) ? avatar.image : ""
+      source: root.safeAvatarImage(avatar.image)
       sourceSize.width: avatar.size
       sourceSize.height: avatar.size
       fillMode: Image.PreserveAspectCrop
@@ -173,8 +183,13 @@ Panel {
       anchors.fill: parent
       hoverEnabled: true
       enabled: avatar.interactive
+      acceptedButtons: Qt.NoButton
       cursorShape: Qt.PointingHandCursor
-      onClicked: {
+    }
+    TapHandler {
+      enabled: avatar.interactive
+      acceptedButtons: Qt.LeftButton
+      onTapped: {
         avatar.forceActiveFocus()
         avatar.clicked()
       }
@@ -214,6 +229,10 @@ Panel {
   }
   function handle(person) {
     return String(person && person.handle || "").replace(/^@/, "")
+  }
+  function safeAvatarImage(value) {
+    var image = String(value || "")
+    return /^https:\/\/avatars\.githubusercontent\.com\//.test(image) || /^https:\/\/pokachy\.com\/avatars\//.test(image) || /^http:\/\/(127\.0\.0\.1|localhost)(:[0-9]+)?\/avatars\//.test(image) ? image : ""
   }
   function friendForHandle(value) {
     var wanted = String(value || "").replace(/^@/, "")
@@ -375,6 +394,53 @@ Panel {
       friendSearch.forceActiveFocus()
     })
   }
+  function openSettings() {
+    settingsActivationReady = false
+    settingsActivationTimer.restart()
+    settingsOriginalName = String(pokachyState.me && pokachyState.me.name || "").trim()
+    settingsOriginalHandle = handle(pokachyState.me)
+    settingsName.text = settingsOriginalName
+    settingsHandle.text = settingsOriginalHandle
+    settingsPanelContentHeight = Math.max(1, content.implicitHeight)
+    settingsOpen = true
+    panelScroll.contentY = 0
+    Qt.callLater(function () { settingsBack.forceActiveFocus() })
+  }
+  function saveSettings() {
+    if (!settingsCanSave)
+      return
+    runAction("Saving profile…", ["profile", "update", settingsHandle.text.trim(), settingsName.text.trim()])
+  }
+  function resetSettingsEdits() {
+    settingsName.text = settingsOriginalName
+    settingsHandle.text = settingsOriginalHandle
+    Qt.callLater(function () { settingsName.forceActiveFocus() })
+  }
+  function closeSettings() {
+    settingsActivationTimer.stop()
+    settingsActivationReady = false
+    settingsName.text = settingsOriginalName
+    settingsHandle.text = settingsOriginalHandle
+    settingsOpen = false
+    settingsPanelContentHeight = 0
+    panelScroll.contentY = 0
+    Qt.callLater(function () { friendSearch.forceActiveFocus() })
+  }
+
+  // Opening Settings changes the focus chain while the key that opened it can
+  // still be in flight. Briefly ignore activation on newly visible controls so
+  // that Enter opens Settings without also opening the photo chooser.
+  Timer {
+    id: settingsActivationTimer
+    interval: 150
+    onTriggered: root.settingsActivationReady = true
+  }
+  function avatarPath(url) {
+    var value = String(url || "")
+    if (value.indexOf("file://") !== 0)
+      return ""
+    try { return decodeURIComponent(value.substring(7)) } catch (error) { return "" }
+  }
   function ensureListItemVisible(item) {
     if (activeFriend || !item)
       return
@@ -441,8 +507,25 @@ Panel {
   }
   function close() {
     closeConversation()
+    settingsOpen = false
     friendSearch.text = ""
     controller.hide()
+  }
+
+  Dialogs.FileDialog {
+    id: avatarFileDialog
+    title: "Choose a profile picture"
+    fileMode: Dialogs.FileDialog.OpenFile
+    // GTK/GVFS native pickers can abort the host Quickshell process while
+    // creating a directory monitor. Keep the chooser inside Qt Quick so a
+    // profile-photo selection cannot take down the whole desktop shell.
+    options: Dialogs.FileDialog.DontUseNativeDialog
+    nameFilters: ["Images (*.png *.jpg *.jpeg *.webp *.avif)"]
+    onAccepted: {
+      var path = root.avatarPath(selectedFile)
+      if (path !== "")
+        root.runAction("Uploading profile picture…", ["profile", "image", path])
+    }
   }
   function toggle() {
     opened ? close() : open()
@@ -574,6 +657,10 @@ Panel {
         root.pendingPokes = pending
         pendingTimer.restart()
       }
+      if (code === 0 && root.retryArgs[0] === "profile" && root.retryArgs[1] === "update") {
+        root.settingsOriginalHandle = String(root.retryArgs[2] || "")
+        root.settingsOriginalName = String(root.retryArgs[3] || "")
+      }
       root.actionLabel = ""
       root.refresh()
     }
@@ -616,7 +703,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(430), Style.space(520))
-    contentHeight: panel.fittedContentHeight(root.activeFriend ? Style.space(560) : content.implicitHeight, Style.space(650))
+    contentHeight: panel.fittedContentHeight(root.activeFriend ? Style.space(560) : (root.settingsOpen && root.settingsPanelContentHeight > 0 ? root.settingsPanelContentHeight : content.implicitHeight), Style.space(650))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -629,7 +716,7 @@ Panel {
       Shortcut {
         sequence: "Escape"
         enabled: root.opened
-        onActivated: conversationMenu.opened ? conversationMenu.close() : (root.activeFriend ? root.closeConversation() : root.close())
+        onActivated: conversationMenu.opened ? conversationMenu.close() : (root.activeFriend ? root.closeConversation() : (root.settingsOpen ? root.closeSettings() : root.close()))
       }
 
       Flickable {
@@ -680,7 +767,7 @@ Panel {
           }
 
           Item {
-            visible: !root.needsLogin && !root.activeFriend
+            visible: !root.needsLogin && !root.activeFriend && !root.settingsOpen
             width: parent.width
             height: Style.space(44)
             AvatarButton {
@@ -689,7 +776,10 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               label: root.avatarInitial(root.pokachyState.me)
               image: String(root.pokachyState.me && root.pokachyState.me.image || "")
+              tooltipText: "Open your profile settings"
+              interactive: true
               size: Style.space(36)
+              onClicked: root.openSettings()
               Rectangle {
                 anchors.right: parent.right
                 anchors.top: parent.top
@@ -736,6 +826,14 @@ Panel {
                 font.pixelSize: Style.font.caption
               }
             }
+            MouseArea {
+              anchors.left: ownerAvatar.right
+              anchors.right: quietControl.left
+              anchors.top: parent.top
+              anchors.bottom: parent.bottom
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.openSettings()
+            }
             Loader {
               id: quietControl
               anchors.right: parent.right
@@ -746,16 +844,30 @@ Panel {
 
           Component {
             id: accountActions
-            PanelActionButton {
-              iconText: root.pokachyState.me && root.pokachyState.me.quiet ? "󰂛" : "󰂚"
-              tooltipText: root.pokachyState.me && root.pokachyState.me.quiet ? "Resume notifications" : "Quiet notifications"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              size: Style.space(36)
-              fontSize: Style.space(20)
-              focusable: true
-              Accessible.name: tooltipText
-              onClicked: root.runAction("Updating quiet mode…", ["quiet", root.pokachyState.me && root.pokachyState.me.quiet ? "off" : "on"])
+            Row {
+              spacing: Style.space(4)
+              PanelActionButton {
+                iconText: "󰒓"
+                tooltipText: "Profile settings"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                size: Style.space(36)
+                fontSize: Style.space(20)
+                focusable: true
+                Accessible.name: tooltipText
+                onClicked: root.settingsOpen ? root.closeSettings() : root.openSettings()
+              }
+              PanelActionButton {
+                iconText: root.pokachyState.me && root.pokachyState.me.quiet ? "󰂛" : "󰂚"
+                tooltipText: root.pokachyState.me && root.pokachyState.me.quiet ? "Resume notifications" : "Quiet notifications"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                size: Style.space(36)
+                fontSize: Style.space(20)
+                focusable: true
+                Accessible.name: tooltipText
+                onClicked: root.runAction("Updating quiet mode…", ["quiet", root.pokachyState.me && root.pokachyState.me.quiet ? "off" : "on"])
+              }
             }
           }
 
@@ -792,7 +904,7 @@ Panel {
             }
           }
           Text {
-            visible: root.actionNotice !== ""
+            visible: root.actionNotice !== "" && !(root.settingsOpen && root.retryArgs[0] === "profile")
             width: parent.width
             text: root.actionNotice
             textFormat: Text.PlainText
@@ -822,8 +934,378 @@ Panel {
           }
 
           Column {
+            id: settingsView
+            visible: !root.needsLogin && !root.activeFriend && root.settingsOpen
+            width: parent.width
+            spacing: Style.space(4)
+
+            Item {
+              width: parent.width
+              height: Style.space(44)
+              PanelActionButton {
+                id: settingsBack
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: "󰁍"
+                tooltipText: "Back to friends"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                focusable: true
+                Accessible.name: tooltipText
+                onClicked: root.closeSettings()
+              }
+              Column {
+                anchors.left: settingsBack.right
+                anchors.leftMargin: Style.space(10)
+                anchors.right: settingsEditActions.visible ? settingsEditActions.left : parent.right
+                anchors.rightMargin: settingsEditActions.visible ? Style.space(8) : 0
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(1)
+                Text {
+                  text: "Settings"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+                Text {
+                  visible: root.settingsDirty
+                  text: "Unsaved changes"
+                  color: root.secondaryForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+              Row {
+                id: settingsEditActions
+                visible: root.settingsDirty
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+                PanelActionButton {
+                  iconText: "󰅖"
+                  tooltipText: "Revert profile changes"
+                  foreground: root.secondaryForeground
+                  fontFamily: root.fontFamily
+                  focusable: true
+                  Accessible.name: tooltipText
+                  enabled: !root.actionRunning
+                  onClicked: root.resetSettingsEdits()
+                }
+                PanelActionButton {
+                  iconText: "󰄬"
+                  tooltipText: root.settingsCanSave ? "Save profile changes" : "Fix invalid profile fields before saving"
+                  foreground: Color.accent
+                  fontFamily: root.fontFamily
+                  focusable: true
+                  Accessible.name: "Save profile changes"
+                  enabled: root.settingsCanSave
+                  onClicked: root.saveSettings()
+                }
+              }
+            }
+            Row {
+              width: parent.width
+              spacing: Style.space(14)
+              AvatarButton {
+                id: settingsAvatar
+                label: root.avatarInitial(root.pokachyState.me)
+                image: String(root.pokachyState.me && root.pokachyState.me.image || "")
+                tooltipText: "Choose profile picture"
+                foreground: root.foreground
+                interactive: true
+                size: Style.space(52)
+                onClicked: {
+                  if (!root.settingsActivationReady)
+                    return
+                  if (root.pokachyState.me && root.pokachyState.me.customImage === true)
+                    photoMenu.opened ? photoMenu.close() : photoMenu.open()
+                  else
+                    avatarFileDialog.open()
+                }
+                Rectangle {
+                  anchors.right: parent.right
+                  anchors.bottom: parent.bottom
+                  width: Style.space(16)
+                  height: width
+                  radius: width / 2
+                  color: Color.popups.background
+                  border.width: Math.max(1, Style.space(1))
+                  border.color: Color.accent
+                  z: 12
+                  Accessible.ignored: true
+                  Text {
+                    anchors.centerIn: parent
+                    text: "󰏫"
+                    color: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.space(10)
+                  }
+                }
+
+                QQC.Popup {
+                  id: photoMenu
+                  x: 0
+                  y: settingsAvatar.height + Style.space(4)
+                  width: Style.space(176)
+                  padding: Style.space(4)
+                  focus: true
+                  closePolicy: QQC.Popup.CloseOnEscape | QQC.Popup.CloseOnPressOutsideParent
+
+                  background: BorderSurface {
+                    color: Color.popups.background
+                    borderSpec: Border.localOrSurfaceSpec("popups", "border", Color.popups.border, Color.popups.border, Math.max(1, Style.normalBorderWidth))
+                    radius: Style.cornerRadius
+                  }
+
+                  contentItem: Column {
+                    spacing: Style.space(2)
+                    Button {
+                      width: parent.width
+                      text: "Choose photo"
+                      iconText: "󰏫"
+                      leftAlign: true
+                      focusable: true
+                      enabled: !root.actionRunning
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: {
+                        photoMenu.close()
+                        avatarFileDialog.open()
+                      }
+                    }
+                    Button {
+                      width: parent.width
+                      text: root.pokachyState.me && root.pokachyState.me.githubLinked === true ? "Use GitHub photo" : "Remove photo"
+                      iconText: root.pokachyState.me && root.pokachyState.me.githubLinked === true ? "󰊤" : "󰆴"
+                      leftAlign: true
+                      focusable: true
+                      enabled: !root.actionRunning
+                      foreground: root.foreground
+                      fontFamily: root.fontFamily
+                      onClicked: {
+                        photoMenu.close()
+                        root.runAction("Removing profile picture…", ["profile", "image", "remove"])
+                      }
+                    }
+                  }
+                }
+              }
+              Column {
+                width: parent.width - settingsAvatar.width - parent.spacing
+                spacing: Style.space(3)
+                TextField {
+                  id: settingsName
+                  width: parent.width
+                  height: Style.space(28)
+                  placeholderText: "Display name"
+                  maximumLength: 80
+                  leftPadding: Style.space(38)
+                  activeFocusOnTab: true
+                  Accessible.name: "Display name"
+                  onAccepted: settingsHandle.forceActiveFocus()
+                  Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Aa"
+                    color: root.secondaryForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    Accessible.ignored: true
+                  }
+                }
+                TextField {
+                  id: settingsHandle
+                  width: parent.width
+                  height: Style.space(28)
+                  placeholderText: "username"
+                  maximumLength: 24
+                  leftPadding: Style.space(28)
+                  activeFocusOnTab: true
+                  Accessible.name: "Handle"
+                  onAccepted: root.saveSettings()
+                  Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "@"
+                    color: root.secondaryForeground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    Accessible.ignored: true
+                  }
+                }
+                Item {
+                  width: parent.width
+                  height: Style.space(16)
+                  Text {
+                    anchors.fill: parent
+                    visible: !root.settingsHandleValid && (settingsHandle.activeFocus || settingsHandle.text.trim() !== "")
+                    text: settingsHandle.text.trim() === "" ? "A handle is required." : "Start with a–z or 0–9; then use a–z, 0–9, or _."
+                    textFormat: Text.PlainText
+                    verticalAlignment: Text.AlignVCenter
+                    color: Color.urgent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
+            Item {
+              width: parent.width
+              height: 0
+            }
+            Item {
+              width: parent.width
+              height: Style.space(20)
+              Text {
+                id: accountLabel
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "ACCOUNT"
+                color: root.secondaryForeground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1
+              }
+              PanelActionButton {
+                id: accountOpen
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: "↗"
+                tooltipText: "Open account settings in your browser"
+                foreground: root.secondaryForeground
+                fontFamily: root.fontFamily
+                focusable: true
+                Accessible.name: tooltipText
+                enabled: !root.actionRunning
+                onClicked: root.runAction("Opening account settings…", ["account"])
+              }
+            }
+            Item {
+              width: parent.width
+              height: accountRows.implicitHeight
+              Column {
+                id: accountRows
+                width: parent.width
+                spacing: Style.space(4)
+                Item {
+                  width: parent.width
+                  height: Style.space(44)
+                  Item {
+                    id: githubIconSlot
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(30)
+                    height: width
+                    Text {
+                      anchors.centerIn: parent
+                      text: "󰊤"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.space(24)
+                      Accessible.ignored: true
+                    }
+                  }
+                  Column {
+                    anchors.left: githubIconSlot.right
+                    anchors.leftMargin: Style.space(10)
+                    anchors.right: githubConnect.visible ? githubConnect.left : parent.right
+                    anchors.rightMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(1)
+                    Text {
+                      text: "GitHub"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+                    Text {
+                      text: root.pokachyState.me && root.pokachyState.me.githubLinked === true ? "󰄬  Connected" : (root.pokachyState.me && root.pokachyState.me.githubAvailable === true ? "Not connected" : "Unavailable")
+                      color: root.pokachyState.me && root.pokachyState.me.githubLinked === true ? Color.accent : root.secondaryForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                  Button {
+                    id: githubConnect
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: !!root.pokachyState.me && root.pokachyState.me.githubAvailable === true && root.pokachyState.me.githubLinked !== true
+                    text: "Connect ↗"
+                    tooltipText: "Connect GitHub in your browser"
+                    focusable: true
+                    enabled: !root.actionRunning
+                    onClicked: root.runAction("Opening GitHub connection…", ["account", "github"])
+                  }
+                }
+                Item {
+                  width: parent.width
+                  height: Style.space(44)
+                  Item {
+                    id: emailIconSlot
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(30)
+                    height: width
+                    Text {
+                      anchors.centerIn: parent
+                      text: "󰇮"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.space(24)
+                      Accessible.ignored: true
+                    }
+                  }
+                  Column {
+                    anchors.left: emailIconSlot.right
+                    anchors.leftMargin: Style.space(10)
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(1)
+                    Text {
+                      text: "Email"
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+                    Text {
+                      width: parent.width
+                      text: String(root.pokachyState.me && root.pokachyState.me.email || "") + "  ·  󰄬 Verified"
+                      textFormat: Text.PlainText
+                      elide: Text.ElideRight
+                      color: root.secondaryForeground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+              }
+            }
+            Text {
+              visible: root.actionNotice !== "" && root.retryArgs[0] === "profile"
+              width: parent.width
+              text: root.actionNotice
+              textFormat: Text.PlainText
+              wrapMode: Text.Wrap
+              color: Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          Column {
             id: friendListView
-            visible: !root.needsLogin && !root.activeFriend
+            visible: !root.needsLogin && !root.activeFriend && !root.settingsOpen
             width: parent.width
             spacing: Style.space(8)
 
